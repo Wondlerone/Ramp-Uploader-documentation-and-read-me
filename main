@@ -1,0 +1,435 @@
+import os
+import logging
+import base64
+import json
+from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
+# Assuming sftp_upload.py containing process_csv_upload is in the same directory
+from sftp_upload import process_csv_upload
+import tempfile # Was in original, keep it
+
+# Basic logging configuration (can be overridden by Cloud Run)
+# Ensure logging is configured before first use if not done elsewhere
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s:%(message)s')
+
+app = Flask(__name__)
+
+# --- Configuration ---
+PROJECT_ID = "ramp-data-upload" # Updated to new project ID
+ALLOWED_EXTENSIONS = {"csv"}
+# Set to True for test mode (no SFTP upload), False for production
+# Reads from environment variable TEST_MODE, defaults to True if not set
+TEST_MODE = os.environ.get("TEST_MODE", "True").lower() == "true"
+# Where to save test files if in test mode
+# Reads from environment variable TEST_OUTPUT_DIR, defaults to /tmp/test_uploads if not set
+TEST_OUTPUT_DIR = os.environ.get("TEST_OUTPUT_DIR", "/tmp/test_uploads")
+
+logging.info(f"Application starting. TEST_MODE={TEST_MODE}, TEST_OUTPUT_DIR={TEST_OUTPUT_DIR}")
+
+# --- Helper Functions ---
+def allowed_file(filename: str) -> bool:
+    """Checks if the filename has an allowed extension."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def process_test_upload(file_data_or_obj, filename, project_id):
+    """
+    Test version of process_csv_upload that doesn't connect to SFTP.
+    Saves the file locally to TEST_OUTPUT_DIR and logs details.
+    Accepts either bytes or a file storage object.
+    """
+    logging.info(f"TEST MODE: Processing upload for file {filename}")
+
+    # Ensure test directory exists (safe to call multiple times)
+    try:
+        os.makedirs(TEST_OUTPUT_DIR, exist_ok=True)
+        logging.info(f"Ensured test directory exists: {TEST_OUTPUT_DIR}")
+    except OSError as e:
+        logging.error(f"Error creating test directory {TEST_OUTPUT_DIR}: {e}")
+        return {"status": "error", "message": f"Could not create test directory: {e}"}
+
+    # Construct the full save path
+    save_path = os.path.join(TEST_OUTPUT_DIR, filename)
+    logging.info(f"Attempting to save test file to: {save_path}")
+
+    try:
+        if isinstance(file_data_or_obj, bytes):
+            # Handle raw byte data (e.g., from JSON base64)
+            with open(save_path, 'wb') as f:
+                f.write(file_data_or_obj)
+            logging.info(f"Saved byte data to {save_path}")
+        # Check specifically for Werkzeug FileStorage object
+        elif hasattr(file_data_or_obj, 'save') and callable(file_data_or_obj.save):
+            # Handle file storage object (e.g., from form upload)
+            # Ensure the file pointer is at the beginning if it might have been read before
+            try:
+                file_data_or_obj.seek(0)
+            except Exception as seek_e:
+                logging.warning(f"Could not seek file object for {filename}: {seek_e}. Proceeding anyway.")
+            file_data_or_obj.save(save_path)
+            logging.info(f"Saved file object to {save_path}")
+        else:
+            # Handle unexpected type
+            logging.error(f"Unsupported data type received in process_test_upload: {type(file_data_or_obj)}")
+            return {"status": "error", "message": "Unsupported file data type for test upload"}
+
+
+        # Log file details after saving
+        if os.path.exists(save_path):
+            file_size = os.path.getsize(save_path)
+            line_count = 0
+            # Count lines safely, handling potential encoding issues for the count
+            try:
+                # Open as bytes to avoid decode errors just for line counting
+                with open(save_path, 'rb') as f:
+                     line_count = sum(1 for _ in f)
+            except Exception as count_e:
+                 logging.warning(f"Could not count lines in {save_path}: {count_e}")
+
+
+            result = {
+                "status": "success",
+                "message": f"TEST MODE: File {filename} saved locally.",
+                "details": {
+                    "file_path": save_path,
+                    "file_size_bytes": file_size,
+                    "line_count": line_count,
+                    "sftp_connection": "simulated"
+                }
+            }
+            # Avoid logging potentially large file paths directly if sensitive
+            logging.info(json.dumps({"message": "Test file processing complete", "filename": filename, "details": result["details"]}))
+            return result
+        else:
+             logging.error(f"File not found after saving attempt: {save_path}")
+             return {"status": "error", "message": "File save failed."}
+
+    except Exception as e:
+        logging.error(f"Error saving file in process_test_upload for {filename}: {e}", exc_info=True)
+        # Attempt cleanup if save failed partially
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except Exception as remove_e:
+                logging.error(f"Failed to remove partial file {save_path}: {remove_e}")
+        return {"status": "error", "message": f"Error saving test file: {str(e)}"}
+
+
+# --- Flask Routes ---
+
+@app.route("/", methods=["GET"])
+def health_check():
+    """Basic health check endpoint."""
+    mode = "TEST" if TEST_MODE else "PRODUCTION"
+    logging.info("Health check endpoint called.")
+    return jsonify({
+        "status": "healthy",
+        "service": "RAMP Data Upload Service",  # Updated service name
+        "mode": mode
+    }), 200
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    """Handles file uploads via multipart/form-data or JSON payload."""
+    # Use app context logger if preferred: current_app.logger.info(...)
+    logging.info(f"Upload request received. TEST_MODE={TEST_MODE}")
+    try:
+        content_type = request.headers.get("Content-Type", "").lower()
+
+        # --- Handle Form Data Upload ---
+        if "multipart/form-data" in content_type:
+            if "file" not in request.files:
+                logging.warning("Upload attempt failed: No file part in form data.")
+                return jsonify({"status": "error", "message": "No file part"}), 400
+
+            file = request.files["file"] # This is a FileStorage object
+
+            if file.filename == "":
+                logging.warning("Upload attempt failed: No file selected in form data.")
+                return jsonify({"status": "error", "message": "No file selected"}), 400
+
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                logging.info(f"Processing form data upload for file: {filename}")
+
+                if TEST_MODE:
+                    # Pass the FileStorage object directly to test function
+                    result = process_test_upload(file, filename, PROJECT_ID)
+                else:
+                    # For production, read the content into memory first
+                    file_data = file.read()
+                    if not file_data:
+                        logging.warning(f"File {filename} received via form data is empty.")
+                        # Decide how to handle empty files - error or success?
+                        # return jsonify({"status": "error", "message": "Received empty file"}), 400
+                    logging.info(f"Read {len(file_data)} bytes from form upload file {filename} for production.")
+                    result = process_csv_upload(file_data, filename, PROJECT_ID) # Pass bytes
+
+                status_code = 200 if result.get("status") == "success" else 500
+                logging.info(f"Form data upload result for {filename}: Status={result.get('status')}, Code={status_code}")
+                return jsonify(result), status_code
+            else:
+                logging.warning(f"Upload attempt failed: Invalid file type '{file.filename}' via form data.")
+                return jsonify({"status": "error", "message": "Invalid file type. Only CSV files are allowed"}), 400
+
+        # --- Handle JSON Payload Upload ---
+        elif "application/json" in content_type:
+            request_json = request.get_json(silent=True)
+
+            if not request_json:
+                logging.warning("Upload attempt failed: Invalid JSON received.")
+                return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+
+            if "filename" not in request_json or "data" not in request_json:
+                logging.warning("Upload attempt failed: JSON missing required fields 'filename' or 'data'.")
+                return jsonify({"status": "error", "message": "Missing required fields 'filename' or 'data'"}), 400
+
+            filename = secure_filename(request_json["filename"])
+
+            if not allowed_file(filename):
+                logging.warning(f"Upload attempt failed: Invalid file type in JSON '{filename}'")
+                return jsonify({"status": "error", "message": "Invalid file type. Only CSV files are allowed"}), 400
+
+            try:
+                # Decode base64 data
+                file_data = base64.b64decode(request_json["data"])
+                logging.info(f"Processing JSON upload for file: {filename}, decoded size: {len(file_data)} bytes")
+
+                if not file_data and request_json["data"]:
+                     logging.warning(f"File {filename} received via JSON resulted in empty data after base64 decode. Original data length: {len(request_json['data'])}")
+                     # Decide how to handle empty files
+                     # return jsonify({"status": "error", "message": "Received empty file after decoding"}), 400
+                elif not file_data and not request_json["data"]:
+                     logging.warning(f"File {filename} received via JSON had empty 'data' field.")
+                     # return jsonify({"status": "error", "message": "Received empty file"}), 400
+
+
+                if TEST_MODE:
+                    # Pass the decoded bytes to the test function
+                    result = process_test_upload(file_data, filename, PROJECT_ID)
+                else:
+                    result = process_csv_upload(file_data, filename, PROJECT_ID)
+
+                status_code = 200 if result.get("status") == "success" else 500
+                logging.info(f"JSON upload result for {filename}: Status={result.get('status')}, Code={status_code}")
+                return jsonify(result), status_code
+            except base64.binascii.Error as b64_error:
+                 logging.warning(f"Upload attempt failed: Invalid Base64 data for {filename}. Error: {b64_error}")
+                 return jsonify({"status": "error", "message": f"Invalid Base64 data provided."}), 400
+            except Exception as e:
+                logging.error(f"Error processing JSON data for {filename}: {e}", exc_info=True)
+                return jsonify({"status": "error", "message": f"Error processing data: {str(e)}"}), 400
+        else:
+            logging.warning(f"Upload attempt failed: Unsupported content type '{content_type}'")
+            return jsonify({"status": "error", "message": "Unsupported Content-Type"}), 415
+
+    except Exception as e:
+        # Catch-all for unexpected errors in the upload endpoint
+        logging.error(f"Critical error in /upload endpoint: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": f"An internal server error occurred: {str(e)}"}), 500
+
+
+# --- Start of the FINAL test_info function ---
+@app.route("/test", methods=["GET"])
+def test_info():
+    """
+    Endpoint to verify test mode configuration, show saved test files,
+    and optionally display a preview of a specific test file's content.
+    (Version with fix for StopIteration on short files)
+    """
+    # Log at the start of the function execution
+    logging.info(f"Test info endpoint called. Request args: {request.args}")
+    if not TEST_MODE:
+        logging.warning("Test info endpoint called but not in TEST_MODE.")
+        return jsonify({"status": "error", "message": "Not in test mode"}), 400
+
+    file_details = []
+    requested_filename = None
+    file_preview_lines = None
+    preview_error = None # Stores specific error messages for preview failure
+
+    try:
+        # --- Get requested filename ---
+        requested_filename = request.args.get('file')
+        if requested_filename:
+             logging.info(f"Preview requested for file: {requested_filename}")
+
+        # --- Check if test directory exists ---
+        if not os.path.exists(TEST_OUTPUT_DIR):
+            logging.warning(f"Test output directory '{TEST_OUTPUT_DIR}' does not exist.")
+            # Return success, but indicate the directory doesn't exist yet
+            return jsonify({
+                "status": "success",
+                "test_mode": True,
+                "test_output_dir": TEST_OUTPUT_DIR,
+                "files": [],
+                "message": f"Test output directory '{TEST_OUTPUT_DIR}' does not exist yet."
+            }), 200
+        logging.info(f"Test output directory found: {TEST_OUTPUT_DIR}")
+
+        # --- List all files ---
+        files_in_dir = os.listdir(TEST_OUTPUT_DIR)
+        logging.info(f"Files/Items found in test directory: {files_in_dir}")
+        for filename in files_in_dir:
+            file_path = os.path.join(TEST_OUTPUT_DIR, filename)
+            # Check if it's a file to avoid errors with directories etc.
+            if os.path.isfile(file_path):
+                try:
+                    file_details.append({
+                        "name": filename,
+                        "size_bytes": os.path.getsize(file_path),
+                        "last_modified_unix": os.path.getmtime(file_path) # Modification time
+                    })
+                except Exception as e:
+                    # Log error getting details for one file, but continue with others
+                    logging.warning(f"Could not get details for file: {file_path}. Error: {e}", exc_info=True)
+            else:
+                logging.debug(f"Skipping item (not a file): {file_path}")
+
+
+        # --- Try reading preview if requested ---
+        if requested_filename:
+            # Sanitize filename to prevent directory traversal etc.
+            safe_filename = secure_filename(requested_filename)
+            logging.info(f"Processing preview request for safe filename: {safe_filename}")
+
+            # Check if sanitization removed the filename entirely or changed it (might indicate bad input)
+            if safe_filename != requested_filename or not safe_filename:
+                preview_error = f"Invalid filename requested: '{requested_filename}' (sanitized to: '{safe_filename}')"
+                logging.warning(preview_error)
+            else:
+                # Construct the full path within the designated test directory
+                full_path = os.path.join(TEST_OUTPUT_DIR, safe_filename)
+                # Get absolute paths for reliable checking
+                abs_output_dir = os.path.abspath(TEST_OUTPUT_DIR)
+                abs_full_path = os.path.abspath(full_path)
+                logging.info(f"Checking file path: {full_path} (absolute: {abs_full_path})")
+
+                # Security check: ensure the file path is strictly within the test output dir
+                if not abs_full_path.startswith(abs_output_dir):
+                     preview_error = f"Access denied (path resolves outside test dir)."
+                     logging.warning(f"{preview_error} Attempted Path: {abs_full_path}")
+                # Check if the file actually exists at the path
+                elif not os.path.isfile(full_path):
+                    preview_error = f"File not found: '{safe_filename}'."
+                    logging.warning(f"{preview_error} Looked in {TEST_OUTPUT_DIR}")
+                else:
+                    # File exists and path is safe, proceed with reading
+                    logging.info(f"File found, attempting to read preview: {full_path}")
+                    # --- FIXED FILE READING LOGIC ---
+                    try:
+                        # First, count the total lines to determine if truncation message is needed
+                        # Use 'rb' for counting to avoid decoding errors on potentially non-text files or mixed encodings
+                        lines_count = 0
+                        with open(full_path, 'rb') as f:
+                             lines_count = sum(1 for _ in f)
+                        logging.info(f"File line count: {lines_count}")
+
+                        # Now, read up to the first 20 lines iteratively for preview
+                        file_preview_lines = []
+                        # Use errors='replace' during read to handle potential bad characters gracefully for preview
+                        # This avoids crashing on decode errors but might show replacement characters ()
+                        with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                            # Use enumerate to count lines as we read (starts from 0)
+                            for i, line in enumerate(f):
+                                # Stop if we have read 20 lines (i counts 0 to 19)
+                                if i >= 20:
+                                    logging.debug("Reached 20 line limit for preview.")
+                                    break
+                                # Append the line (removing only trailing newline/whitespace)
+                                file_preview_lines.append(line.rstrip())
+
+                        logging.info(f"Read {len(file_preview_lines)} lines for preview.")
+
+                        # Add truncation indicator message if the file had more than 20 lines
+                        if lines_count > 20:
+                             logging.debug("Adding truncation indicator.")
+                             # Check file_preview_lines exists and is not empty before potentially accessing index -1
+                             if file_preview_lines and not file_preview_lines[-1].startswith("..."):
+                                  file_preview_lines.append("... [File truncated - Showing first 20 lines] ...")
+                             elif not file_preview_lines: # Handle edge case: file has >20 lines but reading yielded nothing (unlikely)
+                                  file_preview_lines.append("... [File truncated - Showing first 20 lines] ...")
+
+
+                    # --- END OF FIXED LOGIC ---
+
+                    # Catch specific expected errors during file read
+                    except FileNotFoundError:
+                         # Should be caught by os.path.isfile, but include for robustness
+                         preview_error = f"File disappeared before reading: '{safe_filename}'"
+                         logging.error(preview_error, exc_info=True)
+                         file_preview_lines = None # Ensure preview is cleared
+                    except UnicodeDecodeError as e:
+                        # Should be less likely with errors='replace', but kept for safety
+                        # This would indicate a severe encoding issue even replacing fails.
+                        preview_error = f"File '{safe_filename}' has severe encoding issues. Error: {e}"
+                        logging.error(f"Encoding error reading preview for {full_path}: {e}", exc_info=True)
+                        file_preview_lines = None # Ensure preview is cleared
+                    # Catch any other unexpected exceptions during the file read/process
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        error_details = str(e)
+                        error_repr = repr(e)
+                        preview_error = f"Unexpected Read Error: Type={error_type}, Details='{error_details}', Repr='{error_repr}'"
+                        logging.error(
+                            f"Unexpected error reading preview for {full_path}: Type={error_type}, Details='{error_details}', Repr='{error_repr}'",
+                            exc_info=True # Log traceback
+                        )
+                        file_preview_lines = None # Ensure preview is cleared on error
+
+
+        # --- Prepare JSON response ---
+        response_data = {
+            "status": "success",
+            "test_mode": True,
+            "test_output_dir": TEST_OUTPUT_DIR,
+            # Sort by last modified, newest first
+            "files": sorted(file_details, key=lambda x: x.get('last_modified_unix', 0), reverse=True)
+        }
+
+        # Add preview/error information if a file was specifically requested
+        if requested_filename:
+            response_data["requested_file_name"] = requested_filename
+            # Check if preview attempt resulted in an error string
+            if preview_error:
+                response_data["requested_file_content_preview"] = [f"Error: {preview_error}"]
+                logging.info(f"Returning preview error for {requested_filename}: {preview_error}")
+            # Check if preview attempt resulted in a list of lines (could be empty list for empty file)
+            elif file_preview_lines is not None:
+                response_data["requested_file_content_preview"] = file_preview_lines
+                logging.info(f"Returning preview content for {requested_filename} ({len(file_preview_lines)} lines)")
+            else:
+                 # This case means requested_filename was set, but preview wasn't attempted (e.g., invalid filename from start)
+                 # Provide a clearer fallback message based on context
+                 if 'safe_filename' in locals() and not safe_filename: # Check if filename was sanitized away
+                      response_data["requested_file_content_preview"] = [f"Invalid or unsafe filename provided: '{requested_filename}'"]
+                 else: # General fallback if no preview and no specific error
+                      response_data["requested_file_content_preview"] = ["Preview not available for an unknown reason."]
+
+
+        # Log successful processing of the test info request
+        logging.info(f"Test info request processed successfully. Files listed: {len(file_details)}, Preview requested: {'Yes' if requested_filename else 'No'}")
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        # Catch unexpected errors in the whole test_info function execution
+        logging.error(f"Critical error in /test endpoint", exc_info=True)
+        # Return a generic server error response
+        error_response = {"status": "error", "message": f"An internal server error occurred."}
+        # Include requested filename in error response if relevant
+        if requested_filename:
+             error_response["requested_file_name"] = requested_filename
+        return jsonify(error_response), 500
+# --- End of the FINAL test_info function ---
+
+
+# --- Main Execution Guard ---
+if __name__ == "__main__":
+    # Get port from environment variable, default to 8080
+    port = int(os.environ.get("PORT", 8080))
+    # Run the Flask development server
+    # host='0.0.0.0' makes it accessible externally (needed for Cloud Run)
+    # debug=False is essential for production/Cloud Run (debug mode exposes security risks)
+    logging.info(f"Starting Flask app directly (likely for local testing) on host 0.0.0.0 port {port}")
+    # Note: When deployed to Cloud Run, Google uses a production-grade server (like Gunicorn)
+    # based on the Dockerfile CMD or Procfile, not this app.run().
+    app.run(host="0.0.0.0", port=port, debug=False)
