@@ -1,0 +1,501 @@
+# BigQuery to SFTP Export System - Implementation Guide
+
+## Overview
+
+This system securely exports data from BigQuery and uploads it to an SFTP server through a two-component architecture:
+
+1. **SFTP Uploader Service (Cloud Run)** - Handles authentication and upload to SFTP servers
+2. **BigQuery Export Function (Cloud Function)** - Queries BigQuery and sends data to the SFTP Uploader
+
+## Key Lessons Learned
+
+### 1. Service Account Configuration is Critical
+
+**Problem:** 403 Forbidden errors between services occur due to improper service account configuration, not code issues.
+
+**Solution:** Create dedicated service accounts with minimal permissions for each component.
+
+**Implementation:**
+
+```bash
+# Create service account for SFTP uploader
+gcloud iam service-accounts create ramp-sftp-uploader-sa \
+  --display-name="RAMP SFTP Uploader Service Account"
+
+# Grant Secret Manager access ONLY to this account
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:ramp-sftp-uploader-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+# Deploy Cloud Run service with this specific account
+gcloud run deploy SERVICE_NAME \
+  --image IMAGE_URL \
+  --service-account=ramp-sftp-uploader-sa@PROJECT_ID.iam.gserviceaccount.com
+```
+
+**Note:** Never use the default compute service account in production systems. Always create dedicated ones with least privilege.
+
+### 2. Service-to-Service Authentication
+
+**Problem:** 403 errors when one service calls another even after setting up service accounts.
+
+**Solution:** Grant explicit invoker permissions AND implement proper token authentication in code.
+
+**Implementation:**
+
+```bash
+# Grant one service permission to call another
+gcloud run services add-iam-policy-binding TARGET_SERVICE \
+  --member=serviceAccount:CALLER_SERVICE_ACCOUNT_EMAIL \
+  --role=roles/run.invoker \
+  --region=REGION
+
+# In the calling service, implement proper token authentication:
+import google.auth.transport.requests, google.oauth2.id_token
+
+audience = "https://target-service-url.run.app"
+token = google.oauth2.id_token.fetch_id_token(
+    google.auth.transport.requests.Request(), audience
+)
+requests.post(audience, headers={"Authorization": f"Bearer {token}"}, ...)
+```
+
+**Note:** The audience parameter must exactly match the target service URL.
+
+### 3. Environment Variables and Secrets
+
+**Problem:** Service account keys and other secrets must be securely passed to services.
+
+**Solution:**
+- For SFTP credentials: Use Secret Manager
+- For service account keys: Use environment variables (when needed)
+
+**Implementation:**
+
+```bash
+# Create secrets for SFTP connection
+echo -n "sftp-hostname.example.com" | gcloud secrets create SFTP_HOST --data-file=-
+echo -n "username" | gcloud secrets create SFTP_USERNAME --data-file=-
+echo -n "password" | gcloud secrets create SFTP_PASSWORD --data-file=-
+echo -n "/remote/path" | gcloud secrets create SFTP_DIRECTORY --data-file=-
+
+# Use secrets in Cloud Run service
+gcloud run deploy SERVICE_NAME \
+  --update-secrets="SFTP_HOST=SFTP_HOST:latest,SFTP_USERNAME=SFTP_USERNAME:latest,SFTP_PASSWORD=SFTP_PASSWORD:latest,SFTP_DIRECTORY=SFTP_DIRECTORY:latest"
+```
+
+**Note:** Keep base64-encoded service account keys in a secure location if you need to deploy repeatedly.
+
+### 4. Cloud Function Deployment
+
+**Problem:** When updating Cloud Functions, parameters can be lost between deployments.
+
+**Solution:** Always specify ALL parameters in deployment commands or use a deployment script.
+
+**Implementation:**
+
+```bash
+gcloud functions deploy FUNCTION_NAME \
+  --gen2 \
+  --runtime=python311 \
+  --region=REGION \
+  --source=. \
+  --entry-point=ENTRY_POINT \
+  --trigger-http \
+  --service-account=SERVICE_ACCOUNT_EMAIL \
+  --set-env-vars="KEY1=VALUE1,KEY2=VALUE2" \
+  --allow-unauthenticated  # Only if public access is needed
+```
+
+**Note:** For updates, use `gcloud functions deploy` (not `update`). This command handles both creation and updates.
+
+### 5. Debugging Service Permissions
+
+When debugging 403 issues, check these in order:
+
+1. **Check the service account being used:**
+   ```bash
+   # For Cloud Run
+   gcloud run services describe SERVICE_NAME --region=REGION --format="value(serviceAccountEmail)"
+   
+   # For Cloud Functions
+   gcloud functions describe FUNCTION_NAME --gen2 --region=REGION --format="value(serviceConfig.serviceAccountEmail)"
+   ```
+
+2. **Check if proper invoker permissions are granted:**
+   ```bash
+   gcloud run services get-iam-policy SERVICE_NAME --region=REGION
+   ```
+
+3. **Test authentication directly from the command line:**
+   ```bash
+   # Get ID token for the service
+   TOKEN=$(gcloud auth print-identity-token --audiences=SERVICE_URL)
+   
+   # Call the service with the token
+   curl -H "Authorization: Bearer $TOKEN" SERVICE_URL
+   ```
+
+4. **Check for organization policies that might restrict service invocation**
+
+### 6. Implementing BigQuery Domain-Wide Delegation
+
+When accessing BigQuery with domain delegation, the code must:
+
+```python
+from google.oauth2 import service_account
+from google.cloud import bigquery
+
+# Load service account key from environment variable
+import base64
+import json
+import os
+
+# Get and decode service account key
+encoded_key = os.environ.get('SERVICE_ACCOUNT_KEY')
+key_json = base64.b64decode(encoded_key).decode('utf-8')
+
+# Create credentials with necessary scopes
+credentials = service_account.Credentials.from_service_account_info(
+    info=json.loads(key_json),
+    scopes=[
+        'https://www.googleapis.com/auth/bigquery',
+        'https://www.googleapis.com/auth/drive.readonly'
+    ]
+)
+
+# Create delegated credentials - key for domain-wide delegation
+delegated_credentials = credentials.with_subject("serviceaccount@domain.com")
+
+# Use delegated credentials with BigQuery client
+client = bigquery.Client(
+    project="project-id",
+    credentials=delegated_credentials
+)
+```
+
+## Complete Architecture Setup
+
+### SFTP Uploader Service
+
+1. Create service account
+   ```bash
+   gcloud iam service-accounts create sftp-uploader-sa
+   ```
+
+2. Grant Secret Manager access
+   ```bash
+   gcloud projects add-iam-policy-binding PROJECT_ID \
+     --member="serviceAccount:sftp-uploader-sa@PROJECT_ID.iam.gserviceaccount.com" \
+     --role="roles/secretmanager.secretAccessor"
+   ```
+
+3. Create SFTP secrets
+   ```bash
+   echo -n "sftp-host.example.com" | gcloud secrets create SFTP_HOST --data-file=-
+   echo -n "username" | gcloud secrets create SFTP_USERNAME --data-file=-
+   echo -n "password" | gcloud secrets create SFTP_PASSWORD --data-file=-
+   echo -n "/remote/dir" | gcloud secrets create SFTP_DIRECTORY --data-file=-
+   ```
+
+4. Deploy SFTP Uploader
+   ```bash
+   gcloud run deploy sftp-uploader \
+     --image gcr.io/PROJECT_ID/sftp-uploader \
+     --platform managed \
+     --region REGION \
+     --service-account=sftp-uploader-sa@PROJECT_ID.iam.gserviceaccount.com \
+     --set-env-vars="PROJECT_ID=PROJECT_ID,TEST_MODE=False" \
+     --update-secrets="SFTP_HOST=SFTP_HOST:latest,SFTP_USERNAME=SFTP_USERNAME:latest,SFTP_PASSWORD=SFTP_PASSWORD:latest,SFTP_DIRECTORY=SFTP_DIRECTORY:latest" \
+     --no-allow-unauthenticated
+   ```
+
+### BigQuery Export Function
+
+1. Create service account
+   ```bash
+   gcloud iam service-accounts create bq-export-sa
+   ```
+
+2. Grant BigQuery access
+   ```bash
+   gcloud projects add-iam-policy-binding PROJECT_ID \
+     --member="serviceAccount:bq-export-sa@PROJECT_ID.iam.gserviceaccount.com" \
+     --role="roles/bigquery.jobUser"
+   ```
+
+3. Grant permission to invoke SFTP uploader
+   ```bash
+   gcloud run services add-iam-policy-binding sftp-uploader \
+     --member="serviceAccount:bq-export-sa@PROJECT_ID.iam.gserviceaccount.com" \
+     --role="roles/run.invoker" \
+     --region=REGION
+   ```
+
+4. Prepare service account key file (if using domain delegation)
+   ```bash
+   echo "BASE64_ENCODED_KEY" > service-account-key.txt
+   ```
+
+5. Deploy BigQuery Export function
+   ```bash
+   gcloud functions deploy bigquery-export \
+     --gen2 \
+     --runtime=python311 \
+     --region=REGION \
+     --source=. \
+     --entry-point=export_and_upload \
+     --trigger-http \
+     --service-account=bq-export-sa@PROJECT_ID.iam.gserviceaccount.com \
+     --set-env-vars="SERVICE_ACCOUNT_KEY=$(cat service-account-key.txt)" \
+     --allow-unauthenticated
+   ```
+
+### Cloud Scheduler
+
+1. Set up scheduled execution
+   ```bash
+   gcloud scheduler jobs create http daily-export \
+     --location=REGION \
+     --schedule="0 15 * * *" \
+     --uri="https://REGION-PROJECT_ID.cloudfunctions.net/bigquery-export" \
+     --http-method=POST \
+     --oidc-service-account-email=bq-export-sa@PROJECT_ID.iam.gserviceaccount.com \
+     --oidc-token-audience="https://REGION-PROJECT_ID.cloudfunctions.net/bigquery-export"
+   ```
+
+## Common Issues and Troubleshooting
+
+### 1. 403 Forbidden between Services
+
+**Likely causes:**
+- Missing `roles/run.invoker` permission
+- Incorrect service account
+- Missing or invalid authentication token
+- Audience mismatch in the ID token
+
+**Verification:**
+```bash
+# Check IAM permissions
+gcloud run services get-iam-policy TARGET_SERVICE --region=REGION
+
+# Test direct invocation
+TOKEN=$(gcloud auth print-identity-token --audiences=SERVICE_URL)
+curl -H "Authorization: Bearer $TOKEN" SERVICE_URL
+```
+
+### 2. SFTP Connection Issues
+
+**Potential causes:**
+- Incorrect credentials in Secret Manager
+- Host key verification failures
+- IP allow-listing issues
+- Cipher/MAC compatibility issues
+
+**Verification:**
+```bash
+# Check secret values
+gcloud secrets versions access latest --secret=SFTP_HOST
+gcloud secrets versions access latest --secret=SFTP_USERNAME
+
+# Run in TEST_MODE first
+gcloud run services update sftp-uploader \
+  --set-env-vars="TEST_MODE=True"
+```
+
+### 3. BigQuery Access Issues
+
+**Likely causes:**
+- Incorrect service account key
+- Missing BigQuery permissions
+- Domain delegation not set up properly
+
+**Verification:**
+```bash
+# Check BigQuery permissions
+gcloud projects get-iam-policy PROJECT_ID | grep bigquery
+
+# Test with simpler query first
+# Modify main.py to use a simple query like "SELECT 1"
+```
+
+## Best Practices
+
+1. **Always use dedicated service accounts** with least privilege for each component
+2. **Test incrementally** - start with test mode, then switch to production
+3. **Handle authentication token generation properly** - use the correct audience
+4. **Use Secret Manager** for sensitive credentials
+5. **Check service logs** when debugging issues
+6. **Keep the service account key secure** - consider alternatives to storing it in environment variables
+7. **Use separate projects** for development, testing, and production
+8. **Deploy with scripts** to ensure consistent configuration
+
+## Complete Code Examples
+
+### SFTP Uploader Code (Python)
+
+```python
+import os
+import logging
+import paramiko
+from google.cloud import secretmanager
+from typing import Dict, Optional, Union, BinaryIO
+
+def get_secret(project_id: str, secret_id: str, version_id: str = "latest") -> str:
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
+
+def process_csv_upload(data: Union[bytes, BinaryIO], filename: str, project_id: str) -> Dict:
+    try:
+        # Save data to temp file
+        temp_path = f"/tmp/{filename}"
+        
+        if isinstance(data, bytes):
+            with open(temp_path, "wb") as f:
+                f.write(data)
+        else:
+            with open(temp_path, "wb") as f:
+                f.write(data.read())
+        
+        # Get SFTP credentials from Secret Manager
+        sftp_host = get_secret(project_id, "SFTP_HOST")
+        sftp_username = get_secret(project_id, "SFTP_USERNAME")
+        sftp_password = get_secret(project_id, "SFTP_PASSWORD")
+        sftp_directory = get_secret(project_id, "SFTP_DIRECTORY")
+        
+        # Set up connection
+        transport = paramiko.Transport((sftp_host, 22))
+        transport.connect(username=sftp_username, password=sftp_password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        
+        # Navigate to the correct directory
+        try:
+            sftp.chdir(sftp_directory)
+        except IOError:
+            logging.error(f"Directory {sftp_directory} not found or inaccessible")
+            transport.close()
+            return {"status": "error", "message": "Directory not found"}
+        
+        # Upload the file
+        remote_path = f"{remote_filename}"
+        sftp.put(temp_path, remote_path)
+        
+        # Close connection
+        sftp.close()
+        transport.close()
+        
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        
+        return {"status": "success", "message": f"File {filename} uploaded successfully"}
+    
+    except Exception as e:
+        logging.error(f"Error processing upload: {str(e)}")
+        if os.path.exists(f"/tmp/{filename}"):
+            os.remove(f"/tmp/{filename}")
+        return {"status": "error", "message": str(e)}
+```
+
+### BigQuery Export Function Code (Python)
+
+```python
+import os
+import json
+import tempfile
+import functions_framework
+import requests
+import csv
+from google.oauth2 import service_account
+from google.cloud import bigquery
+import base64
+import google.auth.transport.requests
+import google.oauth2.id_token
+
+# Configuration
+CLOUD_RUN_URL = "https://sftp-uploader-xxxxx-xx.a.run.app/upload"
+DELEGATED_USER = "serviceaccount@domain.com"
+
+@functions_framework.http
+def export_and_upload(request):
+    try:
+        # Get service account key from environment
+        encoded_key = os.environ.get('SERVICE_ACCOUNT_KEY')
+        if not encoded_key:
+            return {"error": "SERVICE_ACCOUNT_KEY environment variable is missing"}, 500
+            
+        # Decode base64 string to JSON
+        key_json = base64.b64decode(encoded_key).decode('utf-8')
+        
+        # Create credentials with necessary scopes
+        credentials = service_account.Credentials.from_service_account_info(
+            info=json.loads(key_json),
+            scopes=[
+                'https://www.googleapis.com/auth/bigquery',
+                'https://www.googleapis.com/auth/drive.readonly'
+            ]
+        )
+        
+        # Create delegated credentials for domain-wide delegation
+        delegated_credentials = credentials.with_subject(DELEGATED_USER)
+        
+        # Create BigQuery client with delegated credentials
+        client = bigquery.Client(
+            project="bigquery-project-id",
+            credentials=delegated_credentials
+        )
+        
+        # Execute BigQuery query
+        query = """
+        SELECT * 
+        FROM `project.dataset.table` 
+        """
+        
+        query_job = client.query(query)
+        results = query_job.result()
+        
+        # Create CSV from results
+        with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.csv') as temp:
+            csv_writer = csv.writer(temp)
+            
+            # Write header row
+            column_names = [field.name for field in results.schema]
+            csv_writer.writerow(column_names)
+            
+            # Write data rows
+            row_count = 0
+            for row in results:
+                row_values = [row[column] for column in column_names]
+                csv_writer.writerow(row_values)
+                row_count += 1
+                
+            temp_path = temp.name
+        
+        # Get ID token for Cloud Run authentication
+        audience = CLOUD_RUN_URL
+        auth_req = google.auth.transport.requests.Request()
+        token = google.oauth2.id_token.fetch_id_token(auth_req, audience)
+            
+        # Upload file to SFTP service
+        with open(temp_path, 'rb') as csv_file:
+            files = {'file': (os.path.basename(temp_path), csv_file, 'text/csv')}
+            headers = {"Authorization": f"Bearer {token}"}
+            response = requests.post(CLOUD_RUN_URL, files=files, headers=headers)
+            
+        # Clean up temp file
+        os.unlink(temp_path)
+        
+        # Check response
+        if response.status_code == 200:
+            return f"Successfully exported {row_count} rows", 200
+        else:
+            return f"Error: {response.text}", 500
+            
+    except Exception as e:
+        import traceback
+        return f"Error: {str(e)}\n\n{traceback.format_exc()}", 500
+```
+
+This comprehensive guide should help you avoid the common pitfalls we encountered and provide a detailed reference for setting up this architecture in the future.
