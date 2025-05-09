@@ -1,0 +1,4 @@
+functions-framework==3.4.0
+google-cloud-bigquery==3.11.4
+google-oauth2-tool==0.0.3
+requests==2.31.0
